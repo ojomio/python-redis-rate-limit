@@ -91,6 +91,9 @@ class RateLimit(object):
         if self.acquire_attempt > 0:
             raise GaveUp('Do not nest the usage of %r instance!' % self)
 
+        if not self._max_requests:  # effectively do not control rate limit
+            return
+
         if (self.pessimistic_acquire and
                 self.acquired_times == 0 and  # new task
                 self.has_been_reached()):  # quota is empty
