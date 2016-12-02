@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 #  -*- coding: utf-8 -*-
-from hashlib import sha1
+import datetime
+import time
 from distutils.version import StrictVersion
-from redis.exceptions import NoScriptError
+from hashlib import sha1
+
 from redis import Redis, ConnectionPool
+from redis.exceptions import NoScriptError
 
 __version__ = "0.0.1"
 
@@ -37,12 +40,20 @@ class TooManyRequests(Exception):
     pass
 
 
+class GaveUp(Exception):
+    pass
+
+
+class QuotaTimeout(Exception):
+    pass
+
+
 class RateLimit(object):
     """
     This class offers an abstraction of a Rate Limit algorithm implemented on
     top of Redis >= 2.6.0.
     """
-    def __init__(self, resource, client, max_requests, expire=None, r_connection=None):
+    def __init__(self, resource, client, max_requests, expire=None, pessimistic_acquire=False, blocking=True, r_connection=None):
         """
         Class initialization method checks if the Rate Limit algorithm is
         actually supported by the installed Redis version and sets some
@@ -64,14 +75,61 @@ class RateLimit(object):
             raise RedisVersionNotSupported()
 
         self._rate_limit_key = "rate_limit:{0}_{1}".format(resource, client)
+        self._num_waiting_key = "waiting_rate_limit:{0}_{1}".format(resource, client)
+
         self._max_requests = max_requests
-        self._expire = expire or 1
+        self._expire = expire or 1  # limit requests per this period of time
+        self._acquire_overall_timeout = self._expire * 5  # if cannot acquire this long, fail
+        self._acquire_check_timeout = self._expire / 10.  # if quota is empty, retry after this period
+        self.acquired_times = 0  # number of times rate limiter was used
+        self.acquire_attempt = 0  # current attempt to acquire quota
+
+        self.blocking = blocking
+        self.pessimistic_acquire = pessimistic_acquire
 
     def __enter__(self):
-        self.increment_usage()
+        if self.acquire_attempt > 0:
+            raise GaveUp('Do not nest the usage of %r instance!' % self)
+
+        if (self.pessimistic_acquire and
+                self.acquired_times == 0 and  # new task
+                self.has_been_reached()):  # quota is empty
+            # don't try to acquire
+            raise GaveUp(
+                'Won\'t acquire quota as there are %d instances waiting for it already' %
+                self.number_of_waiting_for_quota()
+            )
+
+        acquire_attempt_start = datetime.datetime.now()
+        self.acquire_attempt = 1
+
+        try:
+            while True:
+                if (self.blocking and
+                        (datetime.datetime.now() - acquire_attempt_start).seconds > self._acquire_overall_timeout):
+                    raise QuotaTimeout('Unable to acquire quota in %.2f secs' % self._acquire_overall_timeout)
+
+                try:
+                    self.increment_usage()
+                except TooManyRequests:
+                    if not self.blocking:
+                        raise
+                    else:
+                        if self.acquire_attempt == 1:
+                            self._redis.incr(self._num_waiting_key)  # +1 process waiting
+                        self.acquire_attempt += 1
+                        time.sleep(self._acquire_check_timeout)
+                else:
+                    self.acquired_times += 1
+                    break
+        except Exception:
+            if self.acquire_attempt > 1:
+                self._redis.decr(self._num_waiting_key)
+            self.acquire_attempt = 0
+            raise
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        self.acquire_attempt = 0
 
     def get_usage(self):
         """
@@ -89,6 +147,13 @@ class RateLimit(object):
         :return: bool: True if limit has been reached or False otherwise
         """
         return self.get_usage() >= self._max_requests
+
+    def number_of_waiting_for_quota(self):
+        """
+        Checks how much RateLimiter instances are waiting for quota
+        :return: int: quantity
+        """
+        return int(self._redis.get(self._num_waiting_key) or 0)
 
     def increment_usage(self):
         """
