@@ -99,12 +99,26 @@ class RateLimit(object):
 
         :return: integer: current usage
         """
+        # perform check first, so not even try to increment usage if not quota is left
+        if self.has_been_reached():
+            raise TooManyRequests()
+
         try:
             current_usage = self._redis.evalsha(
                 INCREMENT_SCRIPT_HASH, 1, self._rate_limit_key, self._expire)
         except NoScriptError:
             current_usage = self._redis.eval(
                 INCREMENT_SCRIPT, 1, self._rate_limit_key, self._expire)
+        # Due to race condition,
+        # several `increment_usage()` instances might have passed the initial check. Example:
+        #
+        # quota = 10
+        # C1. check quota -> 9
+        # C2. check quota -> 9
+        # C1. incr -> 10
+        # C2. incr -> 11 (over quota!)
+        #
+        # So we check the actual usage after increment, too
 
         if int(current_usage) > self._max_requests:
             raise TooManyRequests()
