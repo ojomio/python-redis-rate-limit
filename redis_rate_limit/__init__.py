@@ -42,7 +42,7 @@ class RateLimit(object):
     This class offers an abstraction of a Rate Limit algorithm implemented on
     top of Redis >= 2.6.0.
     """
-    def __init__(self, resource, client, max_requests, expire=None):
+    def __init__(self, resource, client, max_requests, expire=None, r_connection=None):
         """
         Class initialization method checks if the Rate Limit algorithm is
         actually supported by the installed Redis version and sets some
@@ -55,7 +55,11 @@ class RateLimit(object):
         :param max_requests: integer (i.e. ‘10’)
         :param expire: seconds to wait before resetting counters (i.e. ‘60’)
         """
-        self._redis = Redis(connection_pool=REDIS_POOL)
+        if r_connection:
+            self._redis = r_connection
+        else:
+            self._redis = Redis(connection_pool=REDIS_POOL)
+
         if not self._is_rate_limit_supported():
             raise RedisVersionNotSupported()
 
