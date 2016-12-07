@@ -18,6 +18,9 @@ class TestRedisRateLimit(unittest.TestCase):
                                     max_requests=10)
         self.rate_limit._reset()
 
+    def tearDown(self):
+        del self.rate_limit
+
     def _make_10_requests(self):
         """
         Increments usage ten times.
@@ -25,6 +28,10 @@ class TestRedisRateLimit(unittest.TestCase):
         for x in range(0, 10):
             with self.rate_limit:
                 pass
+
+    def _another_thread(self):
+        self.rate_limit.blocking = True
+        self._make_10_requests()
 
     def test_limit_10_max_request(self):
         """
@@ -80,10 +87,6 @@ class TestRedisRateLimit(unittest.TestCase):
             pass
             self.assertLessEqual(self.rate_limit.get_usage(), 10)
 
-    def another_thread(self):
-        self.rate_limit.blocking = True
-        self._make_10_requests()
-
     def test_timeout_when_acquire_with_blocking(self):
         """
         Should raise Timeout Exception when the quota is over and
@@ -104,7 +107,9 @@ class TestRedisRateLimit(unittest.TestCase):
         # By this time there is 100% quota usage and 2 secs before quota recovery
         self.assertEqual(self.rate_limit.acquire_attempt, 0)
 
-        multiprocessing.Process(target=self.another_thread).run()
+        proc = multiprocessing.Process(target=self._another_thread)
+        proc.start()
+        proc.join()
 
         with self.assertRaises(redis_rate_limit.QuotaTimeout):
             with self.rate_limit_2:
@@ -130,7 +135,9 @@ class TestRedisRateLimit(unittest.TestCase):
         """
         self.rate_limit_2 = RateLimit(resource='test', client='localhost',
                                       max_requests=10, expire=5, pessimistic_acquire=True)
-        self._make_10_requests()
+        proc = multiprocessing.Process(target=self._another_thread)
+        proc.start()
+        proc.join()
         with self.assertRaises(redis_rate_limit.GaveUp):
             with self.rate_limit_2:
                 pass

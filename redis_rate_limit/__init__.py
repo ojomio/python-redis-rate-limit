@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 #  -*- coding: utf-8 -*-
 import datetime
+import os
+import threading
 import time
 from distutils.version import StrictVersion
 from hashlib import sha1
@@ -48,11 +50,67 @@ class QuotaTimeout(Exception):
     pass
 
 
+class ThreadLocalCounter(property):
+    _tl_dict = None
+
+    def getter(self, owner):
+        return self.tl_dict.get(self.key(owner), 0)
+
+    def setter(self, owner, val):
+        self.tl_dict[self.key(owner)] = val
+
+    def deleter(self, owner):
+        if self.key(owner) in self.tl_dict:
+            del self.tl_dict[self.key(owner)]
+            if not self.tl_dict:
+                del threading.current_thread().__dict__[
+                    'rlimit_thread_local_pid_%d' % os.getpid()
+                ]
+
+    def __init__(self, name, instance_field_name=None):
+        self.instance_field_name = instance_field_name
+        self.name = name
+        self.used_keys = set()
+        super(ThreadLocalCounter, self).__init__(self.getter, self.setter, self.deleter)
+
+    def key(self, owner):
+        args = [self.name]
+        if self.instance_field_name:
+            args = [getattr(owner, self.instance_field_name)] + args
+        return ':'.join(args)
+
+    @property
+    def tl_dict(self):
+        '''
+        A dictionary local to thread and process
+        :return:
+        '''
+        # current_thread() gives access to particular thread,
+        # but thread identity often stays the same for the main threads after fork, so we need to add pid
+        # to uniquely identify data designated for current thread and process
+        return threading.current_thread().__dict__.setdefault(
+            'rlimit_thread_local_pid_%d' % os.getpid(),
+            {}
+        )
+
+
 class RateLimit(object):
     """
     This class offers an abstraction of a Rate Limit algorithm implemented on
     top of Redis >= 2.6.0.
     """
+    # Current attempt to acquire quota
+    acquire_attempt = ThreadLocalCounter('acquire_attempt', instance_field_name='_rate_limit_key')
+    # Number of times rate limiter was used in this thread/process
+    acquired_times = ThreadLocalCounter('acquired_times', instance_field_name='_rate_limit_key')
+
+    def __del__(self):
+        # delete keys from thread-local storage
+        # ThreadLocalCounter will exist as long as еру last RateLimit is alive, so
+        # it is not reliable to put this in RateLimit.__del__()
+        del self.acquired_times
+        del self.acquire_attempt
+
     def __init__(self, resource, client, max_requests, expire=None, pessimistic_acquire=False, blocking=True, r_connection=None):
         """
         Class initialization method checks if the Rate Limit algorithm is
@@ -81,8 +139,6 @@ class RateLimit(object):
         self._expire = expire or 1  # limit requests per this period of time
         self._acquire_overall_timeout = self._expire * 5  # if cannot acquire this long, fail
         self._acquire_check_timeout = self._expire / 10.  # if quota is empty, retry after this period
-        self.acquired_times = 0  # number of times rate limiter was used
-        self.acquire_attempt = 0  # current attempt to acquire quota
 
         self.blocking = blocking
         self.pessimistic_acquire = pessimistic_acquire
@@ -210,4 +266,3 @@ class RateLimit(object):
         """
         for rate_limit_key in self._redis.keys('rate_limit:*'):
             self._redis.delete(rate_limit_key)
-
